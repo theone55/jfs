@@ -106,3 +106,12 @@ jobs:
           curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/download/v1.8.1/mcp-publisher_linux_amd64.tar.gz" | tar xz mcp-publisher
           ./mcp-publisher login github-oidc
           ./mcp-publisher publish
+      # Smithery (smithery.ai/server/jfolioalpha/jfsecure) takes the same bundle; SMITHERY_API_KEY = an API key
+      # of the jfolioalpha account
+      - name: Publish to Smithery
+        if: env.DONE != '1'
+        env:
+          SMITHERY_API_KEY: ${{ secrets.SMITHERY_API_KEY }}
+        run: |
+          [ -n "$SMITHERY_API_KEY" ] || { echo "::warning::no SMITHERY_API_KEY — publish jfs-$V.mcpb by hand"; exit 0; }
+          npx -y @smithery/cli@4.11.1 mcp publish "./jfs-$V.mcpb" -n jfolioalpha/jfsecure
