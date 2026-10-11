@@ -1,0 +1,19 @@
+[package]
+name = "jfs"
+version = "2.6.0"
+edition = "2021"
+description = "JFSecure's command line and MCP server: use secrets from the running JFSecure app without seeing them"
+license = "MIT"
+repository = "https://github.com/theone55/jfs"
+homepage = "https://secure.jfolio.org/agents"
+
+[dependencies]
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Pipes", "Win32_UI_WindowsAndMessaging"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
