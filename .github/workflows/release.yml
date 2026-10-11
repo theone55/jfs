@@ -73,6 +73,12 @@ jobs:
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           V="${TAG#v}"
+          echo "V=$V" >> "$GITHUB_ENV"
+          # a published bundle is never replaced: the MCP Registry holds its SHA-256, and a version can't be
+          # published twice there — a rerun for an old tag stops here
+          if gh release view "$TAG" --json assets -q '.assets[].name' 2>/dev/null | grep -qx "jfs-$V.mcpb"; then
+            echo "jfs-$V.mcpb is already on the release: nothing to do"; echo "DONE=1" >> "$GITHUB_ENV"; exit 0
+          fi
           mkdir -p b/server/win32 b/server/darwin b/server/linux
           cp bin/jfs-win32/jfs.exe b/server/win32/
           cp bin/jfs-darwin/jfs b/server/darwin/ && chmod 755 b/server/darwin/jfs
@@ -89,8 +95,9 @@ jobs:
           echo "SHA=$SHA" >> "$GITHUB_ENV"; echo "V=$V" >> "$GITHUB_ENV"
           gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "jfs $V" \
             --notes "jfs $V — the MCP server and command line of JFSecure $V. The .mcpb bundle (Windows, macOS universal, Linux) installs the MCP server in clients that take MCP bundles; it needs the JFSecure app running: https://secure.jfolio.org/agents"
-          gh release upload "$TAG" "jfs-$V.mcpb" --clobber
+          gh release upload "$TAG" "jfs-$V.mcpb"
       - name: Publish to the MCP Registry
+        if: env.DONE != '1'
         run: |
           jq --arg v "$V" --arg sha "$SHA" \
             '.version = $v | .packages[0].identifier = "https://github.com/theone55/jfs/releases/download/v\($v)/jfs-\($v).mcpb" | .packages[0].fileSha256 = $sha' \
