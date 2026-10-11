@@ -8,6 +8,8 @@ This repository is the source of `jfs` itself, so you can read exactly what an a
 it sends one JSON request over a local pipe to the **running, unlocked JFSecure app** and prints the answer. It never
 opens vault files, never sees the vault password and has no crypto. (The app is a separate download; `jfs` ships with it.)
 
+![Claude Code asks, JFSecure shows the exact command, the agent gets the output with the token masked](docs/demo.gif)
+
 ## MCP tools
 
 | Tool | What it does | What the agent gets back |
