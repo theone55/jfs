@@ -35,7 +35,9 @@ token is [JFSecure: TOKEN]
 
 1. Install JFSecure and open your vault: `brew install theone55/jfsecure/jfsecure` (macOS),
    `scoop bucket add jfsecure https://github.com/theone55/scoop-jfsecure; scoop install jfsecure/jfsecure` (Windows),
-   or [the installer](https://secure.jfolio.org/download) (Windows, macOS, Linux). `jfs` comes with it and is put on PATH.
+   or [the installer](https://secure.jfolio.org/download) (Windows, macOS, Linux). `jfs` comes with it: on Windows the
+   app puts it on PATH at its first start (open a new terminal afterwards); on macOS (.dmg) and the Linux AppImage use
+   Settings → *Install the jfs command*; Homebrew and the .deb install it for you.
 2. Add the MCP server:
 
 ```sh
