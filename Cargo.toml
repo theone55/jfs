@@ -1,6 +1,6 @@
 [package]
 name = "jfs"
-version = "2.6.1"
+version = "2.6.2"
 edition = "2021"
 description = "JFSecure's command line and MCP server: use secrets from the running JFSecure app without seeing them"
 license = "MIT"
