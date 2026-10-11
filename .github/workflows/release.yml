@@ -77,7 +77,12 @@ jobs:
           cp bin/jfs-win32/jfs.exe b/server/win32/
           cp bin/jfs-darwin/jfs b/server/darwin/ && chmod 755 b/server/darwin/jfs
           cp bin/jfs-linux/jfs b/server/linux/ && chmod 755 b/server/linux/jfs
-          jq --arg v "$V" '.version = $v' mcpb/manifest.json > b/manifest.json
+          # the tools with their input schemas, asked from the built server itself (Smithery needs inputSchema)
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | b/server/linux/jfs mcp | tail -1 \
+            | jq '[.result.tools[] | {name, description, inputSchema}]' > tools.json
+          jq --arg v "$V" --slurpfile t tools.json '.version = $v | .tools = $t[0]' mcpb/manifest.json > b/manifest.json
+          jq -e '.tools | length >= 3' b/manifest.json >/dev/null
           cp LICENSE README.md b/
           (cd b && zip -qr -X "../jfs-$V.mcpb" .)
           SHA=$(sha256sum "jfs-$V.mcpb" | cut -d' ' -f1)
