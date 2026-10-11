@@ -1,0 +1,33 @@
+{
+  "manifest_version": "0.3",
+  "name": "jfs",
+  "display_name": "JFSecure",
+  "version": "0.0.0",
+  "description": "Let AI agents use your API keys and passwords without seeing them: commands run with secrets in their environment, output masked, every use approved in the JFSecure app.",
+  "long_description": "jfs is the MCP server of JFSecure, an offline password and snippet manager. Tools: list_secrets (names only), run_with_secrets (runs a command with a secret's keys as environment variables; every value in the output is masked as [JFSecure: NAME]) and render_template (fills {{Secret:key}} into a file such as .env; the agent only learns which names were filled). There is no tool that returns a value. Every use opens an approval window in the JFSecure desktop app showing the exact command. Requires the JFSecure app (free, Windows / macOS / Linux) running with the vault open: https://secure.jfolio.org/agents",
+  "author": { "name": "jfolio", "url": "https://secure.jfolio.org/" },
+  "repository": { "type": "git", "url": "https://github.com/theone55/jfs.git" },
+  "homepage": "https://secure.jfolio.org/agents",
+  "documentation": "https://secure.jfolio.org/cli",
+  "support": "https://github.com/theone55/jfs/issues",
+  "license": "MIT",
+  "keywords": ["secrets", "password-manager", "env", "credentials", "security"],
+  "server": {
+    "type": "binary",
+    "entry_point": "server/linux/jfs",
+    "mcp_config": {
+      "command": "${__dirname}/server/linux/jfs",
+      "args": ["mcp"],
+      "platform_overrides": {
+        "win32": { "command": "${__dirname}/server/win32/jfs.exe" },
+        "darwin": { "command": "${__dirname}/server/darwin/jfs" }
+      }
+    }
+  },
+  "tools": [
+    { "name": "list_secrets", "description": "Names only (never values): secrets, keys and the environment variable each key becomes" },
+    { "name": "run_with_secrets", "description": "Run a command with a secret's keys as environment variables; output comes back with every value masked" },
+    { "name": "render_template", "description": "Write a file (e.g. .env) from a template, filling in {{Secret:key}}; returns only the names filled in" }
+  ],
+  "compatibility": { "platforms": ["darwin", "win32", "linux"] }
+}

@@ -1,0 +1,96 @@
+# Builds jfs for Windows, macOS (universal) and Linux, packs them into one MCP bundle (.mcpb), attaches it to the
+# GitHub release of the tag and publishes the server to the official MCP Registry (io.github.theone55/jfs).
+# Runs on a tag v* (the JFSecure release CI pushes one with each app release) or by hand for an existing tag.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to (re)build, e.g. v2.6.0'
+        required: true
+
+permissions:
+  contents: write   # the release and its assets
+  id-token: write   # GitHub OIDC login to the MCP Registry
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - { os: windows-latest, platform: win32 }
+          - { os: macos-latest, platform: darwin }
+          - { os: ubuntu-latest, platform: linux }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'darwin' && 'aarch64-apple-darwin,x86_64-apple-darwin' || matrix.platform == 'linux' && 'x86_64-unknown-linux-musl' || '' }}
+      - run: cargo test --locked
+      - name: Build
+        run: |
+          mkdir -p out
+          case "${{ matrix.platform }}" in
+            win32)  cargo build --release --locked && cp target/release/jfs.exe out/ ;;
+            darwin) cargo build --release --locked --target aarch64-apple-darwin
+                    cargo build --release --locked --target x86_64-apple-darwin
+                    lipo -create -output out/jfs target/aarch64-apple-darwin/release/jfs target/x86_64-apple-darwin/release/jfs ;;
+            # static (musl): runs on any distro
+            linux)  sudo apt-get install -y musl-tools >/dev/null
+                    cargo build --release --locked --target x86_64-unknown-linux-musl
+                    cp target/x86_64-unknown-linux-musl/release/jfs out/ ;;
+          esac
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jfs-${{ matrix.platform }}
+          path: out/*
+          retention-days: 3
+
+  bundle:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      # the packaging files (mcpb/, server.json) from main: an older tag may predate them; the code came from the tag
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/download-artifact@v4
+        with:
+          path: bin
+      - name: Pack the .mcpb and publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          V="${TAG#v}"
+          mkdir -p b/server/win32 b/server/darwin b/server/linux
+          cp bin/jfs-win32/jfs.exe b/server/win32/
+          cp bin/jfs-darwin/jfs b/server/darwin/ && chmod 755 b/server/darwin/jfs
+          cp bin/jfs-linux/jfs b/server/linux/ && chmod 755 b/server/linux/jfs
+          jq --arg v "$V" '.version = $v' mcpb/manifest.json > b/manifest.json
+          cp LICENSE README.md b/
+          (cd b && zip -qr -X "../jfs-$V.mcpb" .)
+          SHA=$(sha256sum "jfs-$V.mcpb" | cut -d' ' -f1)
+          echo "SHA=$SHA" >> "$GITHUB_ENV"; echo "V=$V" >> "$GITHUB_ENV"
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "jfs $V" \
+            --notes "jfs $V — the MCP server and command line of JFSecure $V. The .mcpb bundle (Windows, macOS universal, Linux) installs the MCP server in clients that take MCP bundles; it needs the JFSecure app running: https://secure.jfolio.org/agents"
+          gh release upload "$TAG" "jfs-$V.mcpb" --clobber
+      - name: Publish to the MCP Registry
+        run: |
+          jq --arg v "$V" --arg sha "$SHA" \
+            '.version = $v | .packages[0].identifier = "https://github.com/theone55/jfs/releases/download/v\($v)/jfs-\($v).mcpb" | .packages[0].fileSha256 = $sha' \
+            server.json > server.out.json && mv server.out.json server.json
+          cat server.json
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/download/v1.8.1/mcp-publisher_linux_amd64.tar.gz" | tar xz mcp-publisher
+          ./mcp-publisher login github-oidc
+          ./mcp-publisher publish

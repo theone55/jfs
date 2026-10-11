@@ -1,0 +1,17 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.theone55/jfs",
+  "title": "JFSecure",
+  "description": "Let AI agents use secrets without seeing them: masked output, every use approved in JFSecure.",
+  "repository": { "url": "https://github.com/theone55/jfs", "source": "github" },
+  "websiteUrl": "https://secure.jfolio.org/agents",
+  "version": "0.0.0",
+  "packages": [
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/theone55/jfs/releases/download/v0.0.0/jfs-0.0.0.mcpb",
+      "fileSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "transport": { "type": "stdio" }
+    }
+  ]
+}

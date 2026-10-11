@@ -52,6 +52,8 @@ Cursor (`~/.cursor/mcp.json`), Claude Desktop, Windsurf, VS Code — any stdio M
 
 More: https://secure.jfolio.org/agents
 
+Also as an MCP bundle (`.mcpb`, Windows / macOS / Linux) on the [releases](https://github.com/theone55/jfs/releases) page, and in the official MCP Registry as `io.github.theone55/jfs`.
+
 ## Command line
 
 ```
