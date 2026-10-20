@@ -40,7 +40,12 @@ const HELP: &str = "jfs — JFSecure from the command line (the app must be runn
                               password for docker login --password-stdin, ssh …)
   --no-mask                   jfs run: don't mask the output (the window says so)
   -k, --keys a,b              jfs run: only these keys become variables (a secret of
-                              a shared vault — mounted or a team's — needs them)
+                              a shared vault — mounted or a team's — needs them);
+                              key=NAME sets that key under another name:
+                              -k client_secret=MICROSOFT_CLIENT_SECRET
+
+jfs run finds the program on PATH in order, like your shell (Windows: .exe, .cmd…
+in each folder) — in Git Bash `bash` is Git's bash, not WSL's.
 
 Each value asks for your OK in JFSecure: once, or for 15 minutes in this terminal.
 Exit codes: 0 ok · 1 error · 2 usage · 3 not running / locked · 4 denied · 5 not PRO
@@ -160,6 +165,45 @@ fn translit(c: char) -> Option<&'static str> {
     })
 }
 
+// --keys client_secret=MICROSOFT_CLIENT_SECRET: the key client_secret becomes $MICROSOFT_CLIENT_SECRET
+// (user feedback 2026-10-16: a script wanted another name than the key's and needed a wrapper).
+// → (the keys the app is asked for, (the key's own variable → the new name)). The new name is the
+// caller's choice, but the value is the vault's: a forbidden name stays forbidden (a team's value as LD_PRELOAD)
+fn key_renames(keys: &[String]) -> Result<(Vec<String>, Vec<(String, String)>), String> {
+    let (mut plain, mut renames) = (Vec::new(), Vec::new());
+    for k in keys {
+        let Some((key, name)) = k.split_once('=') else {
+            plain.push(k.clone());
+            continue;
+        };
+        let (key, name) = (key.trim(), name.trim());
+        let valid = !name.is_empty() && !name.starts_with(|c: char| c.is_ascii_digit()) && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if key.is_empty() || !valid {
+            return Err(format!("--keys {k}: write key=NAME, the name of letters, digits and _"));
+        }
+        if forbidden_var(name) {
+            return Err(format!("--keys {k}: {name} is never set — it changes how programs run"));
+        }
+        plain.push(key.to_string());
+        renames.push((env_name(key), name.to_string()));
+    }
+    // two variables under one name: the last would win silently and the command get the wrong value
+    let mut names: Vec<String> = plain.iter().map(|k| env_name(k)).filter(|n| !renames.iter().any(|(from, _)| from == n)).collect();
+    names.extend(renames.iter().map(|(_, to)| to.to_ascii_uppercase()));
+    if let Some(n) = names.iter().enumerate().find_map(|(i, n)| names[..i].iter().any(|m| m.eq_ignore_ascii_case(n)).then_some(n)) {
+        return Err(format!("--keys: two variables would be named {n}"));
+    }
+    Ok((plain, renames))
+}
+
+fn rename_vars(vars: &mut [(String, String)], renames: &[(String, String)]) {
+    for (name, _) in vars.iter_mut() {
+        if let Some((_, to)) = renames.iter().find(|(from, _)| from == name) {
+            *name = to.clone();
+        }
+    }
+}
+
 // the value --stdin names, by its key (wg-admin) or its variable (WG_ADMIN)
 fn stdin_value<'a>(vars: &'a [(String, String)], key: &str) -> Result<&'a str, String> {
     let wanted = env_name(key);
@@ -170,9 +214,10 @@ fn stdin_value<'a>(vars: &'a [(String, String)], key: &str) -> Result<&'a str, S
 }
 
 // what the approval window shows for a run: the command, where stdin comes from, whether
-// the output is masked — an approval covers exactly that (cli.rs grant_scope)
-fn shown_run(command: &[String], stdin: Option<&str>, masked: bool) -> String {
-    let mut shown = mcp::shown_command(command);
+// the output is masked, the renamed variables — an approval covers exactly that (cli.rs grant_scope)
+fn shown_run(command: &[String], stdin: Option<&str>, masked: bool, renames: &[(String, String)]) -> String {
+    let mut shown: String = renames.iter().map(|(from, to)| format!("{to}=${from} ")).collect();
+    shown.push_str(&mcp::shown_command(command));
     if let Some(key) = stdin {
         shown.push_str(&format!(" < ${}", env_name(key)));
     }
@@ -339,25 +384,32 @@ fn let_app_come_forward(pipe: &std::fs::File) {
     }
 }
 
-// Windows: a .cmd / .bat (npm, yarn…) found on PATH by name, run as that FILE — the standard library then
-// quotes the arguments for cmd's parser (and refuses ones it can't quote safely), unlike `cmd /C <words>`,
-// where an agent's "&" or "%TOKEN%" would be cmd syntax
-#[cfg(windows)]
-fn batch_on_path(program: &str) -> Option<std::path::PathBuf> {
-    batch_in(program, &std::env::var_os("PATH")?)
+// The program to start: Windows looks it up the way a shell does — the PATH folders in order, in each
+// .com / .exe / .bat / .cmd. std's own search tries System32 BEFORE PATH, so `jfs run -- bash` in Git Bash
+// started WSL's System32\bash.exe instead of Git's bash, which is first on that PATH (user feedback
+// 2026-10-16). A .cmd / .bat (npm, yarn…) found so runs as that FILE — std then quotes the arguments for
+// cmd's parser (and refuses ones it can't quote safely), unlike `cmd /C <words>`, where an agent's "&" or
+// "%TOKEN%" would be cmd syntax. Relative PATH entries (".") are skipped: the current folder needs a path.
+// Not found / a path / unix → as given (std / execvp search PATH themselves).
+fn program(name: &str) -> std::ffi::OsString {
+    #[cfg(windows)]
+    if let Some(found) = std::env::var_os("PATH").and_then(|path| find_in(name, &path)) {
+        return found.into_os_string();
+    }
+    name.into()
 }
 
 #[cfg(windows)]
-fn batch_in(program: &str, path: &std::ffi::OsStr) -> Option<std::path::PathBuf> {
-    if program.contains(['\\', '/', ':']) || std::path::Path::new(program).extension().is_some() {
+fn find_in(program: &str, path: &std::ffi::OsStr) -> Option<std::path::PathBuf> {
+    const EXTS: [&str; 4] = ["com", "exe", "bat", "cmd"];
+    if program.is_empty() || program.contains(['\\', '/', ':']) {
         return None;
     }
-    std::env::split_paths(path).flat_map(|dir| [dir.join(format!("{program}.cmd")), dir.join(format!("{program}.bat"))]).find(|p| p.is_file())
-}
-
-#[cfg(not(windows))]
-fn batch_on_path(_program: &str) -> Option<std::path::PathBuf> {
-    None
+    // node.exe / npm.cmd as named; python3.11 → python3.11.exe
+    let named = std::path::Path::new(program).extension().and_then(|e| e.to_str()).is_some_and(|e| EXTS.iter().any(|x| x.eq_ignore_ascii_case(e)));
+    std::env::split_paths(path).filter(|dir| dir.is_absolute()).flat_map(|dir| {
+        if named { vec![dir.join(program)] } else { EXTS.iter().map(|e| dir.join(format!("{program}.{e}"))).collect() }
+    }).find(|p| p.is_file())
 }
 
 // Windows: a job object holding a command and everything it starts — killed as one at a timeout ONLY
@@ -584,6 +636,13 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let (keys, renames) = match key_renames(&args.keys) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("jfs: {e}");
+            return ExitCode::from(2);
+        }
+    };
     let mut req = json!({"v": PROTOCOL, "cmd": args.cmd, "path": args.path, "answers": args.answers, "command": args.command.join(" ")});
     match args.cmd.as_str() {
         "help" | "-h" | "--help" => {
@@ -601,13 +660,13 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
         "run" => {
-            req["command"] = json!(shown_run(&args.command, args.stdin.as_deref(), !args.no_mask));
+            req["command"] = json!(shown_run(&args.command, args.stdin.as_deref(), !args.no_mask, &renames));
             // checked by the app with the rest, before the window (a typo after an OK was a wasted OK)
             if let Some(key) = &args.stdin {
                 req["stdin"] = json!(key);
             }
             // --keys: only these become variables (a shared vault's secret needs them — the app refuses "every key")
-            let keys = mcp::only_keys(&json!(args.keys), args.stdin.as_deref());
+            let keys = mcp::only_keys(&json!(keys), args.stdin.as_deref());
             if !keys.is_empty() {
                 req["keys"] = json!(keys);
             }
@@ -672,21 +731,22 @@ fn main() -> ExitCode {
             let (mut vars, left_out) = safe_vars(answer["vars"].as_object().into_iter().flatten()
                 .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string())).collect());
             // an app before --keys sends every key: keep the asked ones only
-            if !args.keys.is_empty() {
-                let keys = mcp::only_keys(&json!(args.keys), args.stdin.as_deref());
+            if !keys.is_empty() {
+                let keys = mcp::only_keys(&json!(keys), args.stdin.as_deref());
                 vars.retain(|(name, _)| keys.iter().any(|k| env_name(k) == *name));
             }
             if !left_out.is_empty() {
                 eprintln!("jfs: not set (they change how programs run): {}", left_out.join(", "));
             }
-            let input =match args.stdin.as_deref().map(|k| stdin_value(&vars, k)).transpose() {
-                Ok(i) => i,
+            let input = match args.stdin.as_deref().map(|k| stdin_value(&vars, k)).transpose() {
+                Ok(i) => i.map(String::from),
                 Err(e) => {
                     eprintln!("jfs: {e}");
                     return ExitCode::from(2);
                 }
             };
-            return run(&args.command, &vars, input, !args.no_mask);
+            rename_vars(&mut vars, &renames);
+            return run(&args.command, &vars, input.as_deref(), !args.no_mask);
         }
         _ => {
             let value = answer["value"].as_str().unwrap_or_default();
@@ -759,7 +819,7 @@ fn credential_fields(input: &str) -> std::collections::HashMap<String, String> {
 }
 
 // the command with the service's keys added to its environment; its exit code is ours.
-// Windows finds only .exe by name: a .cmd / .bat (npm, yarn…) goes through cmd /C.
+// The program is looked up like a shell does (`program`).
 // Output that goes to a terminal is the user's own screen and passes untouched (prompts,
 // colors); to a pipe or a file — a script, an AI agent — it is masked line by line.
 fn run(command: &[String], vars: &[(String, String)], input: Option<&str>, mask: bool) -> ExitCode {
@@ -767,27 +827,18 @@ fn run(command: &[String], vars: &[(String, String)], input: Option<&str>, mask:
     use std::process::{Command, Stdio};
     let mask_out = mask && !std::io::stdout().is_terminal();
     let mask_err = mask && !std::io::stderr().is_terminal();
-    let start = |program: &str, args: &[String]| {
-        let mut c = Command::new(program);
-        c.args(args).envs(vars.iter().cloned());
-        if input.is_some() {
-            c.stdin(Stdio::piped());
-        }
-        if mask_out {
-            c.stdout(Stdio::piped());
-        }
-        if mask_err {
-            c.stderr(Stdio::piped());
-        }
-        c.spawn()
-    };
-    let mut child = start(&command[0], &command[1..]);
-    if matches!(&child, Err(e) if e.kind() == std::io::ErrorKind::NotFound) {
-        if let Some(script) = batch_on_path(&command[0]) {
-            child = start(&script.to_string_lossy(), &command[1..]);
-        }
+    let mut c = Command::new(program(&command[0]));
+    c.args(&command[1..]).envs(vars.iter().cloned());
+    if input.is_some() {
+        c.stdin(Stdio::piped());
     }
-    let mut child = match child {
+    if mask_out {
+        c.stdout(Stdio::piped());
+    }
+    if mask_err {
+        c.stderr(Stdio::piped());
+    }
+    let mut child = match c.spawn() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("jfs: can't run {}: {e}", command[0]);
@@ -911,7 +962,7 @@ asks the user itself.";
                     "command": {"type": "array", "items": {"type": "string"}, "minItems": 1, "description": "the program and its arguments"},
                     "cwd": {"type": "string", "description": "working directory (default: this server's)"},
                     "answers": {"type": "object", "additionalProperties": {"type": "string"}, "description": "answers to {{?question}} templates in the values"},
-                    "keys": {"type": "array", "items": {"type": "string"}, "description": "optional: only these keys (or variable names) become variables — pass the ones the command needs (required for a secret of a shared vault)"},
+                    "keys": {"type": "array", "items": {"type": "string"}, "description": "optional: only these keys (or variable names) become variables — pass the ones the command needs (required for a secret of a shared vault). \"key=NAME\" sets the key under another variable name, e.g. \"client_secret=MICROSOFT_CLIENT_SECRET\""},
                     "stdin": {"type": "string", "description": "optional: a key of the secret (or its variable name) whose value is written to the command's stdin — exactly the value, no new line added. For programs that read a password from stdin (docker login --password-stdin, a script run over ssh) instead of piping a variable through a shell"},
                     "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": MAX_TIMEOUT, "description": "at the timeout the command and everything it started are killed; a command that ends in time may leave a background process (a server) running"}
                 }}
@@ -940,15 +991,21 @@ asks the user itself.";
 
     // run_with_secrets' request to the app: the secret, its keys, the command as shown — and the stdin key,
     // checked with the rest before the window (the review #18: also without `keys`)
-    pub fn run_request(a: &Value, command: &[String]) -> Value {
+    // `keys` may rename like the CLI's --keys: "client_secret=MICROSOFT_CLIENT_SECRET"
+    pub fn run_request(a: &Value, command: &[String]) -> Result<Value, String> {
         let mut req = base("run", a["secret"].as_str().unwrap_or_default(), &a["answers"]);
         let stdin_key = a["stdin"].as_str().filter(|k| !k.trim().is_empty());
-        req["keys"] = json!(only_keys(&a["keys"], stdin_key));
+        let (keys, renames) = keys_of(&a["keys"])?;
+        req["keys"] = json!(only_keys(&json!(keys), stdin_key));
         if let Some(k) = stdin_key {
             req["stdin"] = json!(k);
         }
-        req["command"] = json!(shown_run(command, stdin_key, true));
-        req
+        req["command"] = json!(shown_run(command, stdin_key, true, &renames));
+        Ok(req)
+    }
+
+    fn keys_of(keys: &Value) -> Result<(Vec<String>, Vec<(String, String)>), String> {
+        key_renames(&keys.as_array().into_iter().flatten().filter_map(Value::as_str).map(String::from).collect::<Vec<_>>())
     }
 
     fn call(params: &Value) -> Value {
@@ -965,8 +1022,11 @@ asks the user itself.";
                     return text("secret and command are required", true);
                 }
                 let stdin_key = a["stdin"].as_str().filter(|k| !k.trim().is_empty());
-                let keys = only_keys(&a["keys"], stdin_key);
-                let req = run_request(a, &command);
+                let (req, (keys, renames)) = match (run_request(a, &command), keys_of(&a["keys"])) {
+                    (Ok(req), Ok(k)) => (req, k),
+                    (Err(e), _) | (_, Err(e)) => return text(e, true),
+                };
+                let keys = only_keys(&json!(keys), stdin_key);
                 let (mut vars, left_out) = match request(&req) {
                     Ok(r) => safe_vars(r["vars"].as_object().into_iter().flatten().map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string())).collect()),
                     Err((_, e)) => return text(e, true),
@@ -979,9 +1039,11 @@ asks the user itself.";
                     vars.retain(|(name, _)| keys.iter().any(|k| env_name(k) == *name));
                 }
                 let input = match stdin_key.map(|k| stdin_value(&vars, k)).transpose() {
-                    Ok(i) => i,
+                    Ok(i) => i.map(String::from),
                     Err(e) => return text(e, true),
                 };
+                rename_vars(&mut vars, &renames);
+                let input = input.as_deref();
                 let timeout = a["timeout_seconds"].as_u64().unwrap_or(DEFAULT_TIMEOUT).clamp(1, MAX_TIMEOUT);
                 let cwd = a["cwd"].as_str();
                 match run_captured(&command, &vars, input, cwd, Duration::from_secs(timeout)) {
@@ -1075,28 +1137,19 @@ asks the user itself.";
     }
 
     // the command with the variables, its output captured (capped), stopped at the timeout.
-    // Windows: a .cmd / .bat (npm…) through cmd /C, like `jfs run`; no console window pops up.
+    // The program is looked up like `jfs run` does (`program`); on Windows no console window pops up.
     pub fn run_captured(command: &[String], vars: &[(String, String)], input: Option<&str>, cwd: Option<&str>, timeout: Duration) -> Result<Ran, String> {
-        let spawn = |program: &str, args: &[String]| {
-            let mut c = Command::new(program);
-            c.args(args).envs(vars.iter().cloned()).stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() }).stdout(Stdio::piped()).stderr(Stdio::piped());
-            if let Some(d) = cwd.filter(|d| !d.is_empty()) {
-                c.current_dir(d);
-            }
-            #[cfg(windows)]
-            std::os::windows::process::CommandExt::creation_flags(&mut c, 0x0800_0000); // CREATE_NO_WINDOW
-            // its own process group: the timeout stops the whole tree (bash -c "sleep 1000"), not only bash
-            #[cfg(unix)]
-            std::os::unix::process::CommandExt::process_group(&mut c, 0);
-            c.spawn()
-        };
-        let mut child = spawn(&command[0], &command[1..]);
-        if matches!(&child, Err(e) if e.kind() == std::io::ErrorKind::NotFound) {
-            if let Some(script) = batch_on_path(&command[0]) {
-                child = spawn(&script.to_string_lossy(), &command[1..]);
-            }
+        let mut c = Command::new(program(&command[0]));
+        c.args(&command[1..]).envs(vars.iter().cloned()).stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() }).stdout(Stdio::piped()).stderr(Stdio::piped());
+        if let Some(d) = cwd.filter(|d| !d.is_empty()) {
+            c.current_dir(d);
         }
-        let mut child = child.map_err(|e| format!("can't run {}: {e}", command[0]))?;
+        #[cfg(windows)]
+        std::os::windows::process::CommandExt::creation_flags(&mut c, 0x0800_0000); // CREATE_NO_WINDOW
+        // its own process group: the timeout stops the whole tree (bash -c "sleep 1000"), not only bash
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut c, 0);
+        let mut child = c.spawn().map_err(|e| format!("can't run {}: {e}", command[0]))?;
         // Windows: the child and everything it starts in one job, killed together at the timeout
         #[cfg(windows)]
         let job = tree::Job::with(&child);
@@ -1304,9 +1357,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("jfs-test-tool.cmd"), "@echo %1\r\n").unwrap();
         let path = std::env::join_paths([std::env::temp_dir().join("jfs-no-such-dir"), dir.clone()]).unwrap();
-        assert_eq!(batch_in("jfs-test-tool", &path), Some(dir.join("jfs-test-tool.cmd")));
-        assert_eq!(batch_in("jfs-test-tool.cmd", &path), None, "a name with an extension is found by Windows itself");
-        assert_eq!(batch_in("nope", &path), None);
+        assert_eq!(find_in("jfs-test-tool", &path), Some(dir.join("jfs-test-tool.cmd")));
+        assert_eq!(find_in("jfs-test-tool.cmd", &path), Some(dir.join("jfs-test-tool.cmd")));
+        assert_eq!(find_in("nope", &path), None);
         // run as the file, an argument with cmd syntax reaches the script as one quoted word, not as a second command
         let out = std::process::Command::new(dir.join("jfs-test-tool.cmd")).arg("a & echo INJECTED").output().unwrap();
         assert!(!String::from_utf8_lossy(&out.stdout).lines().any(|l| l.trim() == "INJECTED"), "{:?}", String::from_utf8_lossy(&out.stdout));
@@ -1314,6 +1367,53 @@ mod tests {
         let out = std::process::Command::new(dir.join("jfs-test-tool.cmd")).arg("%JFS_TEST_TOKEN%").env("JFS_TEST_TOKEN", "EXPANDED").output().unwrap();
         assert!(!String::from_utf8_lossy(&out.stdout).contains("EXPANDED"), "{:?}", String::from_utf8_lossy(&out.stdout));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_program_is_found_on_path_in_order_like_a_shell_does() {
+        // user feedback 2026-10-16: std looks in System32 before PATH — `bash` was WSL's, not Git Bash's
+        let base = std::env::temp_dir().join(format!("jfs-path-{}", std::process::id()));
+        let (first, second) = (base.join("first"), base.join("second"));
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(first.join("tool.cmd"), "").unwrap();
+        std::fs::write(second.join("tool.exe"), "").unwrap();
+        std::fs::write(second.join("py3.11.exe"), "").unwrap();
+        let path = std::env::join_paths([first.clone(), second.clone()]).unwrap();
+        assert_eq!(find_in("tool", &path), Some(first.join("tool.cmd")), "the first folder wins, whatever the extension");
+        assert_eq!(find_in("tool.exe", &path), Some(second.join("tool.exe")));
+        assert_eq!(find_in("py3.11", &path), Some(second.join("py3.11.exe")), "a dot in the name isn't an extension");
+        assert_eq!(find_in(r".\tool", &path), None, "a path is taken as written");
+        let relative = std::env::join_paths([std::path::PathBuf::from("."), second.clone()]).unwrap();
+        assert_eq!(find_in("tool", &relative), Some(second.join("tool.exe")), "a relative PATH entry is skipped");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn keys_can_be_renamed() {
+        // user feedback 2026-10-16: -k client_secret=MICROSOFT_CLIENT_SECRET instead of a wrapper script
+        let (keys, renames) = key_renames(&["token".into(), "client_secret=MICROSOFT_CLIENT_SECRET".into()]).unwrap();
+        assert_eq!(keys, vec!["token", "client_secret"]);
+        assert_eq!(renames, vec![("CLIENT_SECRET".to_string(), "MICROSOFT_CLIENT_SECRET".to_string())]);
+        let mut vars = vec![("TOKEN".to_string(), "t".to_string()), ("CLIENT_SECRET".to_string(), "s".to_string())];
+        rename_vars(&mut vars, &renames);
+        assert_eq!(vars[1].0, "MICROSOFT_CLIENT_SECRET");
+        assert_eq!(vars[0].0, "TOKEN");
+        assert!(key_renames(&["x=LD_PRELOAD".into()]).unwrap_err().contains("never set"), "a vault's value never gets a forbidden name");
+        assert!(key_renames(&["x=PATH".into()]).is_err());
+        assert!(key_renames(&["x=1ABC".into()]).is_err());
+        assert!(key_renames(&["x=A B".into()]).is_err());
+        assert!(key_renames(&["=NAME".into()]).is_err());
+        assert!(key_renames(&["token".into(), "other=TOKEN".into()]).is_err(), "two variables named TOKEN");
+        assert!(key_renames(&["a=X".into(), "b=x".into()]).is_err(), "Windows names ignore case");
+        assert!(key_renames(&["token=T2".into(), "other=TOKEN".into()]).is_ok(), "a swap away from TOKEN frees it");
+        assert_eq!(shown_run(&["node".into(), "s.js".into()], None, true, &renames), "MICROSOFT_CLIENT_SECRET=$CLIENT_SECRET node s.js");
+        // MCP: the same, the app is asked for the key only
+        let req = mcp::run_request(&json!({"secret": "ms", "keys": ["client_secret=MICROSOFT_CLIENT_SECRET"]}), &["node".into()]).unwrap();
+        assert_eq!(req["keys"], json!(["client_secret"]));
+        assert_eq!(req["command"], json!("MICROSOFT_CLIENT_SECRET=$CLIENT_SECRET node"));
+        assert!(mcp::run_request(&json!({"secret": "ms", "keys": ["x=NODE_OPTIONS"]}), &["node".into()]).is_err());
     }
 
     #[test]
@@ -1325,13 +1425,13 @@ mod tests {
     #[test]
     fn mcp_sends_the_stdin_key_for_the_check() {
         // the review #18: a typo in `stdin` is found before the window, also when no `keys` are given
-        let req = mcp::run_request(&json!({"secret": "docker", "stdin": "password"}), &["docker".into(), "login".into()]);
+        let req = mcp::run_request(&json!({"secret": "docker", "stdin": "password"}), &["docker".into(), "login".into()]).unwrap();
         assert_eq!(req["stdin"], json!("password"));
         assert_eq!(req["keys"], json!([]), "no keys = every key (the stdin key joins only a list)");
         assert_eq!(req["agent"], json!(true));
-        let req = mcp::run_request(&json!({"secret": "d", "keys": ["user"], "stdin": "password"}), &["x".into()]);
+        let req = mcp::run_request(&json!({"secret": "d", "keys": ["user"], "stdin": "password"}), &["x".into()]).unwrap();
         assert_eq!(req["keys"], json!(["user", "password"]));
-        assert!(mcp::run_request(&json!({"secret": "d"}), &["x".into()]).get("stdin").is_none());
+        assert!(mcp::run_request(&json!({"secret": "d"}), &["x".into()]).unwrap().get("stdin").is_none());
     }
 
     #[test]
@@ -1396,8 +1496,8 @@ mod tests {
         assert_eq!(stdin_value(&vars, "TOKEN"), Ok("t0ken-value"));
         assert!(stdin_value(&vars, "nope").unwrap_err().contains("WG_ADMIN, TOKEN"));
         let cmd = ["ssh".to_string(), "host".to_string(), "bash /root/x.sh".to_string()];
-        assert_eq!(shown_run(&cmd, Some("wg-admin"), true), "ssh host \"bash /root/x.sh\" < $WG_ADMIN");
-        assert_eq!(shown_run(&cmd[..1], None, false), "ssh   (output NOT masked)");
+        assert_eq!(shown_run(&cmd, Some("wg-admin"), true, &[]), "ssh host \"bash /root/x.sh\" < $WG_ADMIN");
+        assert_eq!(shown_run(&cmd[..1], None, false, &[]), "ssh   (output NOT masked)");
         // the value reaches the command's stdin exactly (no new line, no BOM)
         let (prog, args): (&str, Vec<&str>) = if cfg!(windows) {
             ("powershell", vec!["-NoProfile", "-Command", "$i = [Console]::In.ReadToEnd(); 'len=' + $i.Length + ' same=' + ($i -eq $env:TOKEN)"])
