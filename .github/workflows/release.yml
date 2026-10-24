@@ -107,11 +107,13 @@ jobs:
           ./mcp-publisher login github-oidc
           ./mcp-publisher publish
       # Smithery (smithery.ai/server/jfolioalpha/jfsecure) takes the same bundle; SMITHERY_API_KEY = an API key
-      # of the jfolioalpha account
+      # of the jfolioalpha account. Since 2026-10 Smithery answers 403 "Updating servers has been removed" to every
+      # update, so a failure here only warns: the release and the MCP Registry are already done above.
       - name: Publish to Smithery
         if: env.DONE != '1'
         env:
           SMITHERY_API_KEY: ${{ secrets.SMITHERY_API_KEY }}
         run: |
           [ -n "$SMITHERY_API_KEY" ] || { echo "::warning::no SMITHERY_API_KEY — publish jfs-$V.mcpb by hand"; exit 0; }
-          npx -y @smithery/cli@4.11.1 mcp publish "./jfs-$V.mcpb" -n jfolioalpha/jfsecure
+          npx -y @smithery/cli@4.11.1 mcp publish "./jfs-$V.mcpb" -n jfolioalpha/jfsecure \
+            || echo "::warning::Smithery refused jfs-$V.mcpb (updates closed on their side) — the release is fine"
