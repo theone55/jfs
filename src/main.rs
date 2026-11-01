@@ -48,7 +48,9 @@ jfs run finds the program on PATH in order, like your shell (Windows: .exe, .cmd
 in each folder) — in Git Bash `bash` is Git's bash, not WSL's.
 
 Each value asks for your OK in JFSecure: once, or for 15 minutes in this terminal.
-Exit codes: 0 ok · 1 error · 2 usage · 3 not running / locked · 4 denied · 5 not PRO
+The command line is part of PRO (status and palette work on any plan).
+Exit codes: 0 ok · 1 error · 2 usage · 3 not running / locked · 4 denied or not
+answered · 5 not PRO (the plan: the account icon in JFSecure's top bar)
 (jfs run: the command's own exit code once it ran)";
 
 const PROTOCOL: u64 = 1;
