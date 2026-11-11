@@ -20,6 +20,12 @@ const HELP: &str = "jfs — JFSecure from the command line (the app must be runn
   jfs render <template> [-o <file>]
                               fill a file's {{Secret:key}} / {{totp:Name}} in (e.g. a
                               .env from .env.tpl) — into <file>, or printed
+  jfs export [-o <file>]      the open vault as an encrypted .jfbackup (the same file
+                              as Backup… in the app, sealed with the vault's password;
+                              mounted and team vaults left out) — into <file>, or printed
+  jfs import <file>           add a .jfbackup made with the open vault's password:
+                              new entries are added, changed ones come as “(imported)”
+                              copies — nothing is overwritten or deleted (asked every time)
   jfs ls [secret|folder]      list secrets and 2FA names, or a secret's keys
   jfs git-credential get      git's credential helper: the login of the secret whose
                               $url is on that host ($user + $token or $password).
@@ -34,7 +40,7 @@ const HELP: &str = "jfs — JFSecure from the command line (the app must be runn
   <secret> may include its folder: work/github/token
   -a, --answer name=value     answer a template's {{?name}} question (repeatable)
   -n                          no new line after the value
-  -o, --output <file>         jfs render: write here (only you can read it)
+  -o, --output <file>         jfs render / export: write here (only you can read it)
   --stdin <key>               jfs run: also write that key's value to the command's
                               stdin — exactly the value, no new line added (a
                               password for docker login --password-stdin, ssh …)
@@ -532,6 +538,16 @@ fn read_template(path: &str) -> Result<String, String> {
     std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))
 }
 
+// a backup for jfs import: as big as Backup… takes (backup.md), the app reads up to 56 MB per request
+const MAX_BACKUP: u64 = 50 * 1024 * 1024;
+
+fn read_backup(path: &str) -> Result<String, String> {
+    if std::fs::metadata(path).map_err(|e| format!("{path}: {e}"))?.len() > MAX_BACKUP {
+        return Err(format!("{path} is larger than 50 MB"));
+    }
+    std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))
+}
+
 // the absolute path, for the approval window (the file need not exist yet)
 fn shown_path(path: &str) -> String {
     let p = std::path::Path::new(path);
@@ -688,6 +704,26 @@ fn main() -> ExitCode {
                 return ExitCode::from(1);
             }
         },
+        "export" if !args.path.is_empty() => {
+            eprintln!("jfs: jfs export [-o <file>]\n\n{HELP}");
+            return ExitCode::from(2);
+        }
+        "export" => req["output"] = json!(args.output.as_deref().map(shown_path).unwrap_or_default()),
+        "import" if args.path.is_empty() || args.output.is_some() => {
+            eprintln!("jfs: jfs import <file>\n\n{HELP}");
+            return ExitCode::from(2);
+        }
+        "import" => match read_backup(&args.path) {
+            Ok(text) => {
+                req["text"] = json!(text);
+                req["file"] = json!(shown_path(&args.path));
+                req["path"] = json!("");
+            }
+            Err(e) => {
+                eprintln!("jfs: {e}");
+                return ExitCode::from(1);
+            }
+        },
         other => {
             eprintln!("jfs: unknown command {other}\n\n{HELP}");
             return ExitCode::from(2);
@@ -714,6 +750,32 @@ fn main() -> ExitCode {
                 }
                 None => print!("{text}"),
             }
+        }
+        "export" => {
+            // ciphertext only: the vault's own password seals it (the app's envelope, backup.md)
+            let text = answer["text"].as_str().unwrap_or_default();
+            if text.is_empty() {
+                eprintln!("jfs: JFSecure sent no backup");
+                return ExitCode::from(1);
+            }
+            let count = answer["count"].as_u64().unwrap_or_default();
+            match &args.output {
+                Some(out) => {
+                    // next to it first, then renamed over it: a failed write never costs the previous backup
+                    let tmp = format!("{out}.jfs-tmp");
+                    if let Err(e) = write_private(&tmp, text).and_then(|_| std::fs::rename(&tmp, out)) {
+                        let _ = std::fs::remove_file(&tmp);
+                        eprintln!("jfs: {out}: {e}");
+                        return ExitCode::from(1);
+                    }
+                    eprintln!("wrote {out} — {count} {}", if count == 1 { "entry" } else { "entries" });
+                }
+                None => print!("{text}"),
+            }
+        }
+        "import" => {
+            let n = |k: &str| answer[k].as_u64().unwrap_or_default();
+            eprintln!("imported {} new, {} as “(imported)” copies; {} already there", n("added"), n("copies"), n("skipped"));
         }
         "status" => {
             let unlocked = answer["unlocked"] == json!(true);
@@ -941,7 +1003,7 @@ mod mcp {
 
     const INSTRUCTIONS: &str = "JFSecure is the user's local password manager. Use it to work WITH secrets without seeing them: \
 run_with_secrets runs a command with a secret's keys as environment variables; render_template writes a file (e.g. .env) with \
-{{Secret:key}} references filled in. Values never come back to you — outputs are masked. Every use asks the user in a JFSecure \
+{{Secret:key}} references filled in; create_secret adds a NEW secret from values you write. Values never come back to you — outputs are masked. Every use asks the user in a JFSecure \
 window; if it is denied or the vault is locked, tell the user and don't retry in a loop. Never ask the user to paste a secret \
 into the chat. SSH keys listed by list_secrets need no tool: run ssh / git / scp as usual — JFSecure is their SSH agent and \
 asks the user itself.";
@@ -976,6 +1038,19 @@ asks the user itself.";
                     "template": {"type": "string", "description": "path of the template file, e.g. /project/.env.tpl"},
                     "output": {"type": "string", "description": "path of the file to write, e.g. /project/.env (only the user can read it)"},
                     "answers": {"type": "object", "additionalProperties": {"type": "string"}}
+                }}
+            },
+            {
+                "name": "create_secret",
+                "description": "Create a NEW secret in the vault open in JFSecure, from values you write yourself (e.g. a blank with the keys a project needs — leave a value empty for the user to fill in — or a config you generated). It never changes or reads an existing secret: a taken name gets \" 2\". Values are stored as plain text ({{ }} is never a reference). The user approves it in JFSecure every time, seeing the name and the keys. Then run_with_secrets / render_template can use it.",
+                "inputSchema": {"type": "object", "required": ["name", "keys"], "properties": {
+                    "name": {"type": "string", "description": "the secret's name, e.g. \"Stripe test\" (no \"/\")"},
+                    "folder": {"type": "string", "description": "optional folder path, e.g. \"work/api\" (created if missing; not a shared / team vault's folder)"},
+                    "keys": {"type": "array", "maxItems": 50, "items": {"type": "object", "required": ["key"], "properties": {
+                        "key": {"type": "string", "description": "e.g. \"token\", \"db-password\" (no spaces or \":\") — becomes $TOKEN / $DB_PASSWORD in run_with_secrets"},
+                        "value": {"type": "string", "description": "optional; empty = a blank the user fills in"}
+                    }}},
+                    "notes": {"type": "string", "description": "optional plain text under the keys (lines must not start with \"$\")"}
                 }}
             }
         ])
@@ -1086,6 +1161,27 @@ asks the user itself.";
                         }
                         Err(e) => text(format!("{output}: {e}"), true),
                     },
+                    Err((_, e)) => text(e, true),
+                }
+            }
+            "create_secret" => {
+                let mut req = base("create", "", &Value::Null);
+                req["name"] = json!(s("name"));
+                req["folder"] = json!(s("folder"));
+                req["notes"] = json!(s("notes"));
+                // only {key, value} strings go on; the app checks the rest (src/utils/cli.js newSecretFor)
+                req["keys"] = json!(a["keys"].as_array().into_iter().flatten().take(51).map(|k| json!({
+                    "key": k["key"].as_str().unwrap_or_default(), "value": k["value"].as_str().unwrap_or_default()
+                })).collect::<Vec<_>>());
+                // the app reads at most 512 KB a request: say so plainly, not as a broken pipe
+                if req.to_string().len() > 500 * 1024 {
+                    return text("too big for one secret (over 500 KB) — split it into several", true);
+                }
+                match request(&req) {
+                    Ok(r) => {
+                        let keys: Vec<&str> = r["keys"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+                        text(format!("Created the secret {} with the keys {}.", r["name"].as_str().unwrap_or_default(), keys.join(", ")), false)
+                    }
                     Err((_, e)) => text(e, true),
                 }
             }
@@ -1458,7 +1554,7 @@ mod tests {
         assert!(mcp::answer(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).is_none(), "no answer to a notification");
         let list = mcp::answer(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})).unwrap();
         let names: Vec<&str> = list["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["list_secrets", "run_with_secrets", "render_template"]);
+        assert_eq!(names, ["list_secrets", "run_with_secrets", "render_template", "create_secret"]);
         // nothing that would return a value
         assert!(!names.iter().any(|n| n.contains("get")));
         assert_eq!(mcp::answer(&json!({"jsonrpc": "2.0", "id": 3, "method": "nope"})).unwrap()["error"]["code"], -32601);
@@ -1516,6 +1612,15 @@ mod tests {
 
     fn p(s: &str) -> Result<Args, String> {
         parse(&s.split_whitespace().map(String::from).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn backup_arguments() {
+        let a = p("export -o f").unwrap();
+        assert_eq!(a.cmd, "export");
+        assert_eq!(a.output.as_deref(), Some("f"));
+        let a = p("import f.jfbackup").unwrap();
+        assert_eq!((a.cmd.as_str(), a.path.as_str()), ("import", "f.jfbackup"));
     }
 
     #[test]
