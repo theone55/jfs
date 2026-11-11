@@ -26,6 +26,13 @@ const HELP: &str = "jfs — JFSecure from the command line (the app must be runn
   jfs import <file>           add a .jfbackup made with the open vault's password:
                               new entries are added, changed ones come as “(imported)”
                               copies — nothing is overwritten or deleted (asked every time)
+  jfs sync <file>             keep the open vault and a .jfbackup in sync both ways —
+                              edits and deletions too, like cloud sync (e.g. a file in a
+                              git repository: git pull, jfs sync, git commit + push).
+                              Changed on both sides: yours stays, the file's comes as a
+                              “(conflict)” copy. Asks every time, unless you chose
+                              “Always for this file” (for a scheduled script)
+  jfs sync --forget <file>    forget that file: its “Always” and what was synced last
   jfs ls [secret|folder]      list secrets and 2FA names, or a secret's keys
   jfs git-credential get      git's credential helper: the login of the secret whose
                               $url is on that host ($user + $token or $password).
@@ -74,12 +81,14 @@ struct Args {
     stdin: Option<String>,
     no_mask: bool,
     keys: Vec<String>,
+    // jfs sync --forget <file>
+    forget: bool,
 }
 
 fn parse(argv: &[String]) -> Result<Args, String> {
     let mut rest = argv.iter();
     let cmd = rest.next().cloned().unwrap_or_else(|| "help".into());
-    let mut args = Args { cmd, path: String::new(), answers: Map::new(), no_newline: false, command: Vec::new(), output: None, stdin: None, no_mask: false, keys: Vec::new() };
+    let mut args = Args { cmd, path: String::new(), answers: Map::new(), no_newline: false, command: Vec::new(), output: None, stdin: None, no_mask: false, keys: Vec::new(), forget: false };
     while let Some(a) = rest.next() {
         match a.as_str() {
             "--" => {
@@ -90,6 +99,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             "-o" | "--output" => args.output = Some(rest.next().ok_or("--output needs a file")?.clone()),
             "--stdin" => args.stdin = Some(rest.next().ok_or("--stdin needs a key")?.clone()),
             "--no-mask" => args.no_mask = true,
+            "--forget" => args.forget = true,
             "-k" | "--keys" => args.keys.extend(rest.next().ok_or("--keys needs key names: --keys token,user")?
                 .split(',').map(str::trim).filter(|k| !k.is_empty()).map(String::from)),
             "-a" | "--answer" => {
@@ -104,6 +114,9 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     }
     if (args.stdin.is_some() || args.no_mask || !args.keys.is_empty()) && args.cmd != "run" {
         return Err("--stdin, --keys and --no-mask are for jfs run".into());
+    }
+    if args.forget && args.cmd != "sync" {
+        return Err("--forget is for jfs sync".into());
     }
     Ok(args)
 }
@@ -548,6 +561,41 @@ fn read_backup(path: &str) -> Result<String, String> {
     std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))
 }
 
+// jfs sync's file: "" when it doesn't exist yet
+fn read_sync_file(path: &str) -> Result<String, String> {
+    match std::fs::metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        _ => read_backup(path),
+    }
+}
+
+// jfs sync's file as one name per file: its folder canonicalized (".\x", "..\repo\x", a symlinked folder → the
+// same path), the name as typed — the app keeps "Always" and the last sync under it (the review #4). The folder
+// must exist; Windows' \\?\ prefix is dropped (\\?\UNC\server → \\server).
+fn sync_path(path: &str) -> Result<String, String> {
+    let p = std::path::Path::new(path);
+    let name = p.file_name().ok_or_else(|| format!("{path}: not a file name"))?;
+    let dir = match p.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    };
+    let dir = std::fs::canonicalize(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let full = dir.join(name).display().to_string();
+    Ok(if let Some(unc) = full.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else {
+        full.strip_prefix(r"\\?\").map(String::from).unwrap_or(full)
+    })
+}
+
+// <file>.jfs-tmp, then renamed over <file>: a failed write never leaves half a file
+fn write_replacing(path: &str, text: &str) -> std::io::Result<()> {
+    let tmp = format!("{path}.jfs-tmp");
+    write_private(&tmp, text).and_then(|_| std::fs::rename(&tmp, path)).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
 // the absolute path, for the approval window (the file need not exist yet)
 fn shown_path(path: &str) -> String {
     let p = std::path::Path::new(path);
@@ -724,6 +772,33 @@ fn main() -> ExitCode {
                 return ExitCode::from(1);
             }
         },
+        "sync" if args.path.is_empty() || args.output.is_some() => {
+            eprintln!("jfs: jfs sync <file>  (or jfs sync --forget <file>)\n\n{HELP}");
+            return ExitCode::from(2);
+        }
+        "sync" if args.forget => match sync_path(&args.path) {
+            Ok(file) => {
+                req["cmd"] = json!("sync-forget");
+                req["file"] = json!(file);
+                req["path"] = json!("");
+            }
+            Err(e) => {
+                eprintln!("jfs: {e}");
+                return ExitCode::from(1);
+            }
+        },
+        // a file that isn't there yet is fine: the first sync writes it
+        "sync" => match sync_path(&args.path).and_then(|file| Ok((file, read_sync_file(&args.path)?))) {
+            Ok((file, text)) => {
+                req["text"] = json!(text);
+                req["file"] = json!(file);
+                req["path"] = json!("");
+            }
+            Err(e) => {
+                eprintln!("jfs: {e}");
+                return ExitCode::from(1);
+            }
+        },
         other => {
             eprintln!("jfs: unknown command {other}\n\n{HELP}");
             return ExitCode::from(2);
@@ -762,9 +837,7 @@ fn main() -> ExitCode {
             match &args.output {
                 Some(out) => {
                     // next to it first, then renamed over it: a failed write never costs the previous backup
-                    let tmp = format!("{out}.jfs-tmp");
-                    if let Err(e) = write_private(&tmp, text).and_then(|_| std::fs::rename(&tmp, out)) {
-                        let _ = std::fs::remove_file(&tmp);
+                    if let Err(e) = write_replacing(out, text) {
                         eprintln!("jfs: {out}: {e}");
                         return ExitCode::from(1);
                     }
@@ -776,6 +849,45 @@ fn main() -> ExitCode {
         "import" => {
             let n = |k: &str| answer[k].as_u64().unwrap_or_default();
             eprintln!("imported {} new, {} as “(imported)” copies; {} already there", n("added"), n("copies"), n("skipped"));
+        }
+        "sync" if args.forget => {
+            if answer["forgotten"] == json!(true) {
+                eprintln!("forgot {} — the next jfs sync asks again and merges without deleting anything", args.path);
+            } else {
+                eprintln!("{} was not synced with the open vault", args.path);
+            }
+        }
+        "sync" => {
+            let n = |k: &str| answer[k].as_u64().unwrap_or_default();
+            let summary = format!("+{} ~{} −{}, {} {}", n("added"), n("changed"), n("removed"), n("conflicts"), if n("conflicts") == 1 { "conflict" } else { "conflicts" });
+            let text = answer["text"].as_str().unwrap_or_default();
+            if text.is_empty() {
+                eprintln!("{summary}; file unchanged");
+                return ExitCode::SUCCESS;
+            }
+            // the file changed while the window was open (a git pull meanwhile): writing would lose that change and
+            // the app would take our text as the new base — refused; the next run merges the new file (GPT review #7)
+            let path = req["file"].as_str().unwrap_or(&args.path).to_string();
+            match read_sync_file(&path) {
+                Ok(now) if now == req["text"].as_str().unwrap_or_default() => {}
+                _ => {
+                    eprintln!("jfs: {}: the file changed while JFSecure was asking — the vault is synced, the file is not: run jfs sync again", args.path);
+                    return ExitCode::from(1);
+                }
+            }
+            // next to it first, then renamed over it: a failed write leaves the old file whole; the canonical path
+            // read above, not the one typed
+            if let Err(e) = write_replacing(&path, text) {
+                eprintln!("jfs: {}: {e} — the vault is synced, the file is not: run jfs sync again", args.path);
+                return ExitCode::from(1);
+            }
+            // only now does the app take the written file as the new base
+            let done = json!({"v": PROTOCOL, "cmd": "sync-done", "file": req["file"], "token": answer["token"]});
+            if let Err((code, e)) = request(&done) {
+                eprintln!("jfs: {e}");
+                return ExitCode::from(code);
+            }
+            eprintln!("{summary}; file written");
         }
         "status" => {
             let unlocked = answer["unlocked"] == json!(true);
@@ -1612,6 +1724,35 @@ mod tests {
 
     fn p(s: &str) -> Result<Args, String> {
         parse(&s.split_whitespace().map(String::from).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn sync_arguments() {
+        let a = p("sync vault.jfbackup").unwrap();
+        assert_eq!((a.cmd.as_str(), a.path.as_str(), a.forget), ("sync", "vault.jfbackup", false));
+        let a = p("sync --forget vault.jfbackup").unwrap();
+        assert_eq!((a.cmd.as_str(), a.path.as_str(), a.forget), ("sync", "vault.jfbackup", true));
+        assert!(p("get x --forget").is_err());
+        assert!(p("sync a b").is_err());
+        // a file that isn't there yet: an empty text, the first sync writes it
+        assert_eq!(read_sync_file("no-such-dir-jfs/none.jfbackup").unwrap(), "");
+        // written next to it and renamed over it, nothing left behind
+        let dir = std::env::temp_dir().join(format!("jfs-sync-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("v.jfbackup");
+        let f = f.to_str().unwrap();
+        write_replacing(f, "one").unwrap();
+        write_replacing(f, "two").unwrap();
+        assert_eq!(std::fs::read_to_string(f).unwrap(), "two");
+        assert!(!std::path::Path::new(&format!("{f}.jfs-tmp")).exists());
+        // one name per file, however it is typed; no \\?\ prefix
+        let canon = sync_path(f).unwrap();
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert_eq!(sync_path(sub.join("..").join("v.jfbackup").to_str().unwrap()).unwrap(), canon);
+        assert!(!canon.starts_with(r"\\?\"), "{canon}");
+        assert!(sync_path(dir.join("no-such-dir").join("x").to_str().unwrap()).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
